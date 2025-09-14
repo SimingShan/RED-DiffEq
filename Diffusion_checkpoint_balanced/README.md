@@ -1,1 +1,0 @@
-# The pretrained weight of diffusion model will be saved here

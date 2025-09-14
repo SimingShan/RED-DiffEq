@@ -7,17 +7,18 @@ from argparse import ArgumentParser
 from datetime import datetime
 import os
 import torch.nn as nn
-import scripts.pytorch_ssim as pytorch_ssim
-from scripts.diffusion_model import *
-from scripts.red_diffeq import *
-from scripts.pde_solver import FWIForward
+import src.utils.pytorch_ssim as pytorch_ssim
+from src.diffusion_model import *
+from src.pde_solver import FWIForward
+from src.inversion import run_inversion, Regularization_method
+from src.utils import data_trans, data_vis
 from accelerate import Accelerator
 from torch.optim import Adam
-import time
+import pickle
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-ssim_loss = pytorch_ssim.SSIM(window_size=11)
+ssim_loss = pytorch_ssim
 l1_loss = nn.L1Loss()
 l2_loss = nn.MSELoss()
 
@@ -43,7 +44,7 @@ def main(regularization, lr, ts, sigma, loss_type, noise_std, initial_type, miss
         timesteps=1000,    # number of steps
         sampling_timesteps=250,
         objective='pred_noise'
-    ).to('cuda')
+    ).to(device)
 
     accelerator = Accelerator(
         split_batches=True,
@@ -52,8 +53,8 @@ def main(regularization, lr, ts, sigma, loss_type, noise_std, initial_type, miss
     opt = Adam(diffusion.parameters(), lr=20, betas=(0.9, 0.99))
     diffusion, opt = accelerator.prepare(diffusion, opt)
     diffusion = accelerator.unwrap_model(diffusion)
-    model_path = os.path.expanduser("Diffusion_checkpoint_balanced/model-4.pt")
-    diffusion.load_state_dict(torch.load(model_path, map_location='cuda')['model'])
+    model_path = os.path.expanduser("pretrained_models/model.pt")
+    diffusion.load_state_dict(torch.load(model_path, map_location=device)['model'])
     diffusion.eval()
     
     # Update directory naming to include arguments
@@ -67,14 +68,12 @@ def main(regularization, lr, ts, sigma, loss_type, noise_std, initial_type, miss
     family_name_list = [file for file in os.listdir(seismic_base_dir) if file.endswith('.npy')]
 
     for family_name in family_name_list:
-        family_results_dir = os.path.join(results_dir, family_name)
+        # print the family name without the extension 'npy'
+        family_results_dir = os.path.join(results_dir, family_name.replace('.npy', ''))
         os.makedirs(family_results_dir, exist_ok=True)
 
         seismic_dir = os.path.join(seismic_base_dir, family_name)
         velocity_dir = os.path.join(velocity_base_dir, family_name)
-        mus, losses, reg_losses_raw_all = [], [], []
-        matrices = {'MAE': [], 'RMSE': [], 'SSIM': []}
-
         seis_data = np.load(seismic_dir)
         velocity_data = np.load(velocity_dir)
         print(f"There are {seis_data.shape[0]} data in the file")
@@ -83,69 +82,12 @@ def main(regularization, lr, ts, sigma, loss_type, noise_std, initial_type, miss
             vel_slice = torch.from_numpy(velocity_data[j:j+1]).float()
             initial_model = data_trans.prepare_initial_model(vel_slice, initial_type, sigma=sigma)
             initial_model = F.pad(initial_model, (1, 1, 1, 1), "constant", 0)
-            red_diff = RED_DiffEq(
-                diffusion_model=diffusion,
-                data_trans_module=data_trans,
-                data_vis_module=data_vis,
-                pytorch_ssim_module=pytorch_ssim
-            )
-            if method == 'red_diff':
-                mu, total_losses, obs_losses, reg_losses, reg_losses_raw, current_MAE, current_RMSE, current_SSIM = red_diff.sample(
-                    mu=initial_model,
-                    mu_true=vel_slice,
-                    y=seis_slice,
-                    ts=ts,
-                    lr=lr,
-                    fwi_forward=fwi_forward,
-                    regularization=regularization,
-                    plot_show=False,
-                    loss_type=loss_type,
-                    noise_std=noise_std,
-                    missing_number=missing_number,
-                    reg_lambda = reg_lambda
-                )
-            else:
-                raise ValueError("Invalid method selected.")
+            Inversion = run_inversion(diffusion, data_trans, data_vis, ssim_loss, regularization)
+            mu, final_results = Inversion.sample(initial_model, vel_slice, seis_slice, ts, lr, reg_lambda, fwi_forward, loss_type, noise_std, missing_number, regularization)
 
-            mu_tensor = mu[:, :, 1:-1, 1:-1].detach().cpu()
-            mu_numpy = mu[:, :, 1:-1, 1:-1].detach().cpu().numpy()
-            vm_data_norm = torch.tensor(data_trans.v_normalize(velocity_data[j:j+1]))
-            mae = l1_loss(mu_tensor, vm_data_norm).item()
-            mse = l2_loss(mu_tensor, vm_data_norm).item()
-            rmse = np.sqrt(mse)
-            ssim = ssim_loss((mu_tensor + 1) / 2, (vm_data_norm + 1) / 2).item()
-
-            matrices['MAE'].append(mae)
-            matrices['RMSE'].append(rmse)
-            matrices['SSIM'].append(ssim)
-
-            mus.append(mu_numpy)
-            losses.append(obs_losses)
-            reg_losses_raw_all.append(reg_losses_raw)
-
-            print(f"MAE: {mae}, RMSE: {rmse}, SSIM: {ssim}")
-
-        # Save collective results for the family
-        mu_result = np.concatenate(mus)
-        losses_result = np.concatenate(losses)
-        reg_losses_raw_result = np.concatenate(reg_losses_raw_all)
-
-        average_mae = np.mean(matrices['MAE'])
-        average_rmse = np.mean(matrices['RMSE'])
-        average_ssim = np.mean(matrices['SSIM'])
-
-        np.save(f'{family_results_dir}/velocity_sample.npy', mu_result)
-        np.save(f'{family_results_dir}/losses.npy', losses_result)
-        np.save(f'{family_results_dir}/reg_losses_raw.npy', reg_losses_raw_result)
-
-        print('*' * 50)
-        print(f'{family_name} sampling is DONE')
-        print(f'Average MAE: {average_mae}, RMSE: {average_rmse}, SSIM: {average_ssim}')
-
-        with open(os.path.join(family_results_dir, 'metrics_summary.txt'), 'w') as f:
-            f.write(f'Average MAE: {average_mae}\n')
-            f.write(f'Average RMSE: {average_rmse}\n')
-            f.write(f'Average SSIM: {average_ssim}\n')
+            # save mu and final_results within one pickle file
+            with open(os.path.join(family_results_dir, f'{j}_results.pkl'), 'wb') as f:
+                pickle.dump({'mu': mu.detach().cpu().numpy(), 'final_results': final_results}, f)
 
 if __name__ == "__main__":
     parser = ArgumentParser()
@@ -158,7 +100,7 @@ if __name__ == "__main__":
     parser.add_argument("--missing_number", type=int, default=0, help="The missing trace of the seismic data")
     parser.add_argument("--initial_type", type=str, default='smoothed', help="Type of initial velocity model")
     parser.add_argument("--method", type=str, default='red_diff', help="Choose to run the benchmark or our method")
-    parser.add_argument("--reg_lambda", type=float, default='0.01', help="The regularization coefficient lambda")
+    parser.add_argument("--reg_lambda", type=float, default=0.01, help="The regularization coefficient lambda")
     args = parser.parse_args()
 
     main(regularization=args.regularization, 
